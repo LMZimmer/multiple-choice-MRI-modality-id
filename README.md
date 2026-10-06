@@ -26,7 +26,7 @@ page with
 - the path of the image relative to the dataset directory (the file for NIfTI, the series folder
   for DICOM),
 - the axial, sagittal and coronal center slice,
-- the choices FLAIR, T2, T1c, T1, ADC, Perf, SEG and OTHER,
+- the choices T1, T1c, T2, FLAIR, ADC, DTI, PERF, SEG and OTHER,
 - a field for notes,
 - a box with header information.
 
@@ -42,6 +42,13 @@ Images are reoriented so that the three columns show the anatomical planes regar
 acquisition plane, in radiological convention (patient right on the left of the image). For 4D data
 the first volume is shown. Segmentations, including DICOM SEG objects, are shown as a mask on
 their own extent. A series that cannot be read still gets a page, without an image.
+
+An image counts as a segmentation if it holds integer labels: apart from the background of 0 it
+has at most 64 different values, all of them positive integers. For these images the slices are
+centered on the center of mass of the labels instead of the center of the image (with
+`--extra_slices` the other two rows move along), and SEG is selected in advance. If the center of
+mass lies in a gap between the labels, the nearest slice with a label is shown. An empty mask
+has nothing to tell it apart from a blank image, so it gets the center slices and no selection.
 
 | Option | Meaning |
 | --- | --- |

@@ -4,8 +4,9 @@
 The dataset directory is searched recursively for NIfTI files (.nii, .nii.gz) and DICOM
 series. Each series gets one page showing the axial, sagittal and coronal center slice (with
 --extra_slices also the slices at center -/+ 1/4 of the field of view), a multiple choice
-box for the modality, a notes field and a box with header information. The filled-in PDF
-is read back with read_review_pdf.py.
+box for the modality, a notes field and a box with header information. For segmentations
+(images that hold integer labels) the slices are centered on the center of mass of the labels
+and SEG is selected in advance. The filled-in PDF is read back with read_review_pdf.py.
 
 Datasets with more than 100 series are split into several PDFs (see --max-pages).
 
@@ -38,8 +39,9 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-MODALITIES = ("FLAIR", "T2", "T1c", "T1", "ADC", "Perf", "SEG", "OTHER")
+MODALITIES = ("T1", "T1c", "T2", "FLAIR", "ADC", "DTI", "PERF", "SEG", "OTHER")
 NIFTI_SUFFIXES = (".nii", ".nii.gz")
+MAX_LABELS = 64  # images with more different values than this are not taken for a segmentation
 
 # Form field names are "<prefix>_<page number>"; read_review_pdf.py relies on these. The path is
 # percent-encoded because form fields with the built-in PDF fonts cannot hold arbitrary characters.
@@ -369,8 +371,37 @@ def display_range(vol: np.ndarray) -> tuple[float, float]:
     return lo, max(hi, lo + 1e-6)
 
 
-def render_grid(vol: np.ndarray, zooms: np.ndarray, dpi: int, extra_slices: bool) -> bytes:
-    """Draw the slices (1 x 3, or 3 x 3 with extra slices) with matplotlib and return them as JPEG."""
+def segmentation_center(vol: np.ndarray) -> np.ndarray | None:
+    """Center of mass of the labelled voxels if the volume is a segmentation, otherwise None.
+
+    A segmentation holds integer labels: apart from the background of 0 it has at most MAX_LABELS
+    different values, all of them positive integers. An image without any label is not counted.
+    Along every axis the center is moved to the nearest slice with a label, because the center of
+    mass can lie in a gap between the labels.
+    """
+    step = max(1, round((vol.size / 2e6) ** (1 / 3)))
+    for sample in (vol[::step, ::step, ::step], vol):  # the subsample rules out most images quickly
+        labels = np.unique(sample[sample != 0])
+        if labels.size > MAX_LABELS or not np.all(np.isfinite(labels) & (labels > 0) & (labels == np.rint(labels))):
+            return None
+    if labels.size == 0:
+        return None
+    labelled = vol != 0
+    center = np.zeros(3, int)
+    for axis in range(3):
+        profile = labelled.sum(axis=tuple(a for a in range(3) if a != axis))
+        slices = np.flatnonzero(profile)
+        center_of_mass = np.average(np.arange(profile.size), weights=profile)
+        center[axis] = slices[np.argmin(np.abs(slices - center_of_mass))]
+    return center
+
+
+def render_grid(vol: np.ndarray, zooms: np.ndarray, dpi: int, extra_slices: bool,
+                center: np.ndarray | None = None) -> bytes:
+    """Draw the slices (1 x 3, or 3 x 3 with extra slices) with matplotlib and return them as JPEG.
+
+    The slices are taken around the center of the volume, or around center (voxel indices) if given.
+    """
     rows = ROWS if extra_slices else ROWS[1:2]
     height = figure_height(extra_slices)
     fig = Figure(figsize=(CONTENT_W / 72, height / 72), dpi=dpi)
@@ -382,8 +413,9 @@ def render_grid(vol: np.ndarray, zooms: np.ndarray, dpi: int, extra_slices: bool
     for col, (title, axis) in enumerate(PLANES):
         horizontal, vertical = (a for a in range(3) if a != axis)
         n = vol.shape[axis]
+        middle = (n - 1) / 2 if center is None else center[axis]
         for row, (label, offset) in enumerate(rows):
-            k = int(np.clip(round((n - 1) / 2 + offset * n), 0, n - 1))
+            k = int(np.clip(round(middle + offset * n), 0, n - 1))
             ax = axes[row, col]
             ax.imshow(np.take(vol, k, axis=axis).T, cmap="gray", vmin=lo, vmax=hi, origin="lower")
             ax.set_aspect(zooms[vertical] / zooms[horizontal], adjustable="datalim")
@@ -400,13 +432,15 @@ def render_grid(vol: np.ndarray, zooms: np.ndarray, dpi: int, extra_slices: bool
     return buffer.getvalue()
 
 
-def render_series(task: tuple[Series, int, bool]) -> tuple[bytes | None, list[tuple[str, str]]]:
+def render_series(task: tuple[Series, int, bool]) -> tuple[bytes | None, list[tuple[str, str]], bool]:
+    """Returns the slices as JPEG, the header information and whether the series is a segmentation."""
     series, dpi, extra_slices = task
     try:
         vol, zooms, info = load_nifti(series.files[0]) if series.kind == "nifti" else load_dicom(series.files)
-        return render_grid(vol, zooms, dpi, extra_slices), info
+        center = segmentation_center(vol)
+        return render_grid(vol, zooms, dpi, extra_slices, center), info, center is not None
     except Exception as error:  # keep the page so that the series still appears in the review
-        return None, [("Error", f"{type(error).__name__}: {error}")]
+        return None, [("Error", f"{type(error).__name__}: {error}")], False
 
 
 # --------------------------------------------------------------------------------------
@@ -436,7 +470,7 @@ def wrap(text: str, font: str, size: float, width: float) -> list[str]:
 
 
 def draw_page(c: canvas.Canvas, number: int, total: int, series: Series, jpeg: bytes | None,
-              info: list[tuple[str, str]], extra_slices: bool):
+              info: list[tuple[str, str]], extra_slices: bool, segmentation: bool = False):
     form = c.acroForm
     figure_h = figure_height(extra_slices)
     y = page_height(extra_slices) - MARGIN
@@ -470,19 +504,18 @@ def draw_page(c: canvas.Canvas, number: int, total: int, series: Series, jpeg: b
         c.drawCentredString(PAGE_W / 2, y + figure_h / 2, "This image could not be read.")
 
     # Multiple choice: large boxes with the label underneath. The boxes are square because reportlab
-    # draws circular buttons correctly only at a size of 20 pt.
+    # draws circular buttons correctly only at a size of 20 pt. SEG is selected in advance for segmentations.
     y -= GAP + MODALITY_H
     c.setStrokeColor(lightgrey)
     c.setLineWidth(0.75)
     c.rect(MARGIN, y, CONTENT_W, MODALITY_H)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(MARGIN + 6, y + MODALITY_H / 2 - 3, "Modality")
-    option_w = (CONTENT_W - LABEL_W) / len(MODALITIES)
+    option_w = CONTENT_W / len(MODALITIES)
     radio = 28
     c.setFont("Helvetica", 10)
     for i, modality in enumerate(MODALITIES):
-        center = MARGIN + LABEL_W + (i + 0.5) * option_w
-        form.radio(name=f"{FIELD_MODALITY}_{number:05d}", value=modality, selected=False, x=center - radio / 2,
+        center = MARGIN + (i + 0.5) * option_w
+        form.radio(name=f"{FIELD_MODALITY}_{number:05d}", value=modality, selected=segmentation and modality == "SEG",
+                   x=center - radio / 2,
                    y=y + MODALITY_H - 6 - radio, size=radio, buttonStyle="check", shape="square", borderWidth=1,
                    borderColor=black, fillColor=white, textColor=black, fieldFlags="noToggleToOff radio",
                    tooltip=modality)
@@ -555,7 +588,7 @@ def main():
         per_part = args.max_pages if args.max_pages > 0 else total
         n_parts = -(-total // per_part)
         failed = []
-        for number, (series, (jpeg, info)) in enumerate(zip(all_series, results), start=1):
+        for number, (series, (jpeg, info, segmentation)) in enumerate(zip(all_series, results), start=1):
             part = (number - 1) // per_part
             if (number - 1) % per_part == 0:
                 output = args.output if n_parts == 1 else args.output.with_name(
@@ -563,7 +596,7 @@ def main():
                 output.parent.mkdir(parents=True, exist_ok=True)
                 c = canvas.Canvas(str(output), pagesize=(PAGE_W, page_height(args.extra_slices)))
                 c.setTitle(f"MRI modality review: {root.name}")
-            draw_page(c, number, total, series, jpeg, info, args.extra_slices)
+            draw_page(c, number, total, series, jpeg, info, args.extra_slices, segmentation)
             if jpeg is None:
                 failed.append(f"{series.label}: {info[0][1]}")
             print(f"[{number}/{total}] {series.label}", file=sys.stderr)

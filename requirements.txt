@@ -1,0 +1,9 @@
+numpy
+matplotlib
+nibabel
+pydicom>=3.0
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg
+reportlab>=4.0
+pypdf>=4.0

@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Default outputs of the review scripts (contain image data)
+modality_review*.pdf
+modality_mapping*.csv

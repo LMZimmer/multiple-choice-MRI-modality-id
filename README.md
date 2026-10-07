@@ -26,7 +26,7 @@ page with
 - the path of the image relative to the dataset directory (the file for NIfTI, the series folder
   for DICOM),
 - the axial, sagittal and coronal center slice,
-- the choices T1, T1c, T2, FLAIR, ADC, DTI, PERF, SEG and OTHER,
+- the choices T1, T1c, T2, FLAIR, ADC, DTI, PERF, SEG, OTHER and UNSURE,
 - a field for notes,
 - a box with header information.
 
@@ -50,6 +50,22 @@ centered on the center of mass of the labels instead of the center of the image 
 mass lies in a gap between the labels, the nearest slice with a label is shown. An empty mask
 has nothing to tell it apart from a blank image, so it gets the center slices and no selection.
 
+For every other image the modality is guessed with [HD-SEQ-ID](https://github.com/neuro-ml-hd/HD-SEQ-ID)
+and the guess is selected in advance, so that the reviewer only has to correct the pages that
+are wrong. HD-SEQ-ID classifies a single axial mid-slice into T1, CT1, T2, FLAIR, SWI, ADC,
+Low-B-DWI, High-B-DWI and T2star-DSCrelated; these are mapped onto the choices as T1, T1c, T2,
+FLAIR, OTHER, ADC, OTHER, OTHER and PERF (see `HD_SEQ_ID_LABELS` in the script). The guess is
+far from perfect. In particular, HD-SEQ-ID was trained on raw scanner images, and on
+skull-stripped, registered or intensity-normalized derivatives most guesses are wrong (on the
+MNI-registered LUMIERE data every image came out as PERF). For such data use
+`-no_initialization`, which leaves all pages unselected. Pages with a blank image or an image that
+HD-SEQ-ID could not process are left unselected as well.
+
+HD-SEQ-ID is expected in the directory `HD-SEQ-ID` next to this repository, set up with its
+`run_mac.sh` and the models (see `AGENT_NOTES.md` there); another location is given with
+`--hd-seq-id`. The images are written as NIfTI files to a temporary directory and classified in
+one HD-SEQ-ID run, which takes about 10 s plus 1 s per image.
+
 | Option | Meaning |
 | --- | --- |
 | `-o`, `--output` | Output PDF (default `modality_review.pdf`) |
@@ -57,12 +73,14 @@ has nothing to tell it apart from a blank image, so it gets the center slices an
 | `--max-pages N` | Maximum number of pages per PDF (default 100); `0` writes a single PDF |
 | `--dpi` | Resolution of the slice images (default 150) |
 | `--workers` | Number of parallel processes |
+| `-no_initialization` | Do not guess the modality with HD-SEQ-ID; no choice is selected in advance except SEG |
+| `--hd-seq-id DIR` | Directory of HD-SEQ-ID (default: `../HD-SEQ-ID`) |
 
 ## 2. Fill in the PDF
 
 Open the PDF in a viewer that supports forms (Adobe Acrobat Reader, Preview, a web browser), click
-one modality box per page, add notes where needed and **save** the file (each part, if there are
-several). Do not use "Print to PDF",
+one modality box per page (or leave the guessed one), add notes where needed and **save** the
+file (each part, if there are several). Do not use "Print to PDF",
 which removes the form.
 
 ## 3. Read the selections

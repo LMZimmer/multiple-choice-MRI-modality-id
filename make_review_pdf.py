@@ -6,7 +6,9 @@ series. Each series gets one page showing the axial, sagittal and coronal center
 --extra_slices also the slices at center -/+ 1/4 of the field of view), a multiple choice
 box for the modality, a notes field and a box with header information. For segmentations
 (images that hold integer labels) the slices are centered on the center of mass of the labels
-and SEG is selected in advance. The filled-in PDF is read back with read_review_pdf.py.
+and SEG is selected in advance. For all other images the modality is guessed with HD-SEQ-ID
+(https://github.com/neuro-ml-hd/HD-SEQ-ID) and the guess is selected in advance, unless
+-no_initialization is given. The filled-in PDF is read back with read_review_pdf.py.
 
 Datasets with more than 100 series are split into several PDFs (see --max-pages).
 
@@ -18,10 +20,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -39,9 +44,14 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-MODALITIES = ("T1", "T1c", "T2", "FLAIR", "ADC", "DTI", "PERF", "SEG", "OTHER")
+MODALITIES = ("T1", "T1c", "T2", "FLAIR", "ADC", "DTI", "PERF", "SEG", "OTHER", "UNSURE")
 NIFTI_SUFFIXES = (".nii", ".nii.gz")
 MAX_LABELS = 64  # images with more different values than this are not taken for a segmentation
+
+# HD-SEQ-ID: the directory with run_mac.sh and the models, and its 9 labels mapped onto the choices
+HD_SEQ_ID_DIR = Path(__file__).resolve().parent.parent / "HD-SEQ-ID"
+HD_SEQ_ID_LABELS = {"T1": "T1", "CT1": "T1c", "T2": "T2", "FLAIR": "FLAIR", "ADC": "ADC", "SWI": "OTHER",
+                    "Low-B-DWI": "OTHER", "High-B-DWI": "OTHER", "T2star-DSCrelated": "PERF"}
 
 # Form field names are "<prefix>_<page number>"; read_review_pdf.py relies on these. The path is
 # percent-encoded because form fields with the built-in PDF fonts cannot hold arbitrary characters.
@@ -432,15 +442,53 @@ def render_grid(vol: np.ndarray, zooms: np.ndarray, dpi: int, extra_slices: bool
     return buffer.getvalue()
 
 
-def render_series(task: tuple[Series, int, bool]) -> tuple[bytes | None, list[tuple[str, str]], bool]:
-    """Returns the slices as JPEG, the header information and whether the series is a segmentation."""
-    series, dpi, extra_slices = task
+def render_series(task: tuple[Series, int, bool, str | None]) -> tuple[bytes | None, list[tuple[str, str]], bool]:
+    """Returns the slices as JPEG, the header information and whether the series is a segmentation.
+
+    If export is given, a series that is not a segmentation is also written to that path as a NIfTI
+    file (RAS+, first volume only) for the modality guess of HD-SEQ-ID. Blank images are not written
+    because HD-SEQ-ID cannot process them.
+    """
+    series, dpi, extra_slices, export = task
     try:
         vol, zooms, info = load_nifti(series.files[0]) if series.kind == "nifti" else load_dicom(series.files)
         center = segmentation_center(vol)
-        return render_grid(vol, zooms, dpi, extra_slices, center), info, center is not None
+        jpeg = render_grid(vol, zooms, dpi, extra_slices, center)
+        if export and center is None and np.any(np.nan_to_num(vol)):
+            nib.save(nib.Nifti1Image(vol, np.diag([*zooms, 1.0])), export)
+        return jpeg, info, center is not None
     except Exception as error:  # keep the page so that the series still appears in the review
         return None, [("Error", f"{type(error).__name__}: {error}")], False
+
+
+# --------------------------------------------------------------------------------------
+# Modality guess with HD-SEQ-ID
+# --------------------------------------------------------------------------------------
+
+def guess_modalities(hd_seq_id: Path, input_dir: Path) -> dict[str, str]:
+    """Run HD-SEQ-ID on the .nii.gz files in input_dir, returns {file name: choice}.
+
+    Files that HD-SEQ-ID could not process are missing from the result.
+    """
+    runner = hd_seq_id / "run_mac.sh"
+    # HD-SEQ-ID rewrites paths with re.sub(input, output, ...), so the input path must not be a
+    # prefix of the output path (the caller takes care of that with the directory names).
+    output_dir = input_dir.with_name("output")
+    log = input_dir.with_name("hd_seq_id.log")
+    with open(log, "w") as f:
+        result = subprocess.run([str(runner), str(input_dir), str(output_dir)], stdout=f, stderr=subprocess.STDOUT)
+    predictions = output_dir / "predictions.csv"
+    if result.returncode != 0 or not predictions.is_file():
+        print(f"HD-SEQ-ID failed (exit code {result.returncode}), no modality is selected in advance. "
+              f"Last lines of its output:", file=sys.stderr)
+        print("".join(log.read_text(errors="replace").splitlines(keepends=True)[-15:]), file=sys.stderr)
+        return {}
+    guesses = {}
+    with open(predictions, newline="") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            if row["predicted_label"] in HD_SEQ_ID_LABELS:  # the label of a failed image is not in the table
+                guesses[row["input"]] = HD_SEQ_ID_LABELS[row["predicted_label"]]
+    return guesses
 
 
 # --------------------------------------------------------------------------------------
@@ -470,7 +518,8 @@ def wrap(text: str, font: str, size: float, width: float) -> list[str]:
 
 
 def draw_page(c: canvas.Canvas, number: int, total: int, series: Series, jpeg: bytes | None,
-              info: list[tuple[str, str]], extra_slices: bool, segmentation: bool = False):
+              info: list[tuple[str, str]], extra_slices: bool, selected: str = ""):
+    """Draws one page; selected is the choice that is ticked in advance (empty for none)."""
     form = c.acroForm
     figure_h = figure_height(extra_slices)
     y = page_height(extra_slices) - MARGIN
@@ -504,7 +553,7 @@ def draw_page(c: canvas.Canvas, number: int, total: int, series: Series, jpeg: b
         c.drawCentredString(PAGE_W / 2, y + figure_h / 2, "This image could not be read.")
 
     # Multiple choice: large boxes with the label underneath. The boxes are square because reportlab
-    # draws circular buttons correctly only at a size of 20 pt. SEG is selected in advance for segmentations.
+    # draws circular buttons correctly only at a size of 20 pt.
     y -= GAP + MODALITY_H
     c.setStrokeColor(lightgrey)
     c.setLineWidth(0.75)
@@ -514,7 +563,7 @@ def draw_page(c: canvas.Canvas, number: int, total: int, series: Series, jpeg: b
     c.setFont("Helvetica", 10)
     for i, modality in enumerate(MODALITIES):
         center = MARGIN + (i + 0.5) * option_w
-        form.radio(name=f"{FIELD_MODALITY}_{number:05d}", value=modality, selected=segmentation and modality == "SEG",
+        form.radio(name=f"{FIELD_MODALITY}_{number:05d}", value=modality, selected=modality == selected,
                    x=center - radio / 2,
                    y=y + MODALITY_H - 6 - radio, size=radio, buttonStyle="check", shape="square", borderWidth=1,
                    borderColor=black, fillColor=white, textColor=black, fieldFlags="noToggleToOff radio",
@@ -568,13 +617,24 @@ def main():
     parser.add_argument("--dpi", type=int, default=150, help="resolution of the slice images (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1),
                         help="number of parallel processes (default: %(default)s)")
+    parser.add_argument("-no_initialization", "--no-initialization", action="store_true",
+                        help="do not guess the modality with HD-SEQ-ID and select it in advance")
+    parser.add_argument("--hd-seq-id", type=Path, default=HD_SEQ_ID_DIR,
+                        help="directory of HD-SEQ-ID with run_mac.sh and the models (default: %(default)s)")
     args = parser.parse_args()
 
     root = args.dataset.resolve()
     if not root.is_dir():
         parser.error(f"{args.dataset} is not a directory")
 
-    with ProcessPoolExecutor(args.workers) if args.workers > 1 else contextlib.nullcontext() as pool:
+    if not args.no_initialization and not (args.hd_seq_id / "run_mac.sh").is_file():
+        parser.error(f"HD-SEQ-ID was not found at {args.hd_seq_id} (no run_mac.sh). Pass its directory with "
+                     f"--hd-seq-id or turn the modality guess off with -no_initialization.")
+
+    # The volumes for HD-SEQ-ID go to a temporary directory. Its path must not contain spaces or
+    # characters with a meaning in regular expressions, which rules out the dataset directory.
+    with ProcessPoolExecutor(args.workers) if args.workers > 1 else contextlib.nullcontext() as pool, \
+            tempfile.TemporaryDirectory(prefix="modality_review_") as tmp:
         print(f"Searching {root} ...", file=sys.stderr)
         all_series = find_series(root, pool)
         if not all_series:
@@ -582,8 +642,25 @@ def main():
         total = len(all_series)
         print(f"Found {total} image series", file=sys.stderr)
 
-        tasks = [(series, args.dpi, args.extra_slices) for series in all_series]
-        results = pool.map(render_series, tasks) if pool else map(render_series, tasks)
+        export_dir = Path(tmp) / "input"
+        export_dir.mkdir()
+        tasks = [(series, args.dpi, args.extra_slices,
+                  None if args.no_initialization else str(export_dir / f"{number:05d}.nii.gz"))
+                 for number, series in enumerate(all_series, start=1)]
+        results = []
+        for number, (series, result) in enumerate(zip(all_series, pool.map(render_series, tasks) if pool
+                                                      else map(render_series, tasks)), start=1):
+            results.append(result)
+            print(f"[{number}/{total}] {series.label}", file=sys.stderr)
+
+        # Modality guess for the pages that are not segmentations
+        guesses = {}
+        exported = len(list(export_dir.iterdir()))
+        if exported:
+            print(f"Guessing the modality of {exported} images with HD-SEQ-ID (about {10 + exported:.0f} s) ...",
+                  file=sys.stderr)
+            guesses = guess_modalities(args.hd_seq_id, export_dir)
+            print(f"HD-SEQ-ID guessed the modality of {len(guesses)} of {exported} images", file=sys.stderr)
 
         per_part = args.max_pages if args.max_pages > 0 else total
         n_parts = -(-total // per_part)
@@ -596,10 +673,10 @@ def main():
                 output.parent.mkdir(parents=True, exist_ok=True)
                 c = canvas.Canvas(str(output), pagesize=(PAGE_W, page_height(args.extra_slices)))
                 c.setTitle(f"MRI modality review: {root.name}")
-            draw_page(c, number, total, series, jpeg, info, args.extra_slices, segmentation)
+            selected = "SEG" if segmentation else guesses.get(f"{number:05d}.nii.gz", "")
+            draw_page(c, number, total, series, jpeg, info, args.extra_slices, selected)
             if jpeg is None:
                 failed.append(f"{series.label}: {info[0][1]}")
-            print(f"[{number}/{total}] {series.label}", file=sys.stderr)
             if number % per_part == 0 or number == total:
                 c.save()
                 print(f"Wrote {output}", file=sys.stderr)
